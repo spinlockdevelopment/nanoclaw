@@ -1,0 +1,3 @@
+[submodule "bastionclaw"]
+	path = bastionclaw
+	url = https://github.com/spinlockdevelopment/bastionclaw
