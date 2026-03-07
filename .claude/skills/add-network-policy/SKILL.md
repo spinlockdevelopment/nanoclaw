@@ -1,168 +1,126 @@
 ---
 name: add-network-policy
-description: Add container network isolation and egress control. Creates a private Docker network for agents with configurable egress allowlist. Detects LiteLLM proxy and auto-configures. Triggers on "network policy", "egress", "firewall", "network isolation", "container network".
+description: Add container network isolation and egress control. Creates a private Docker network with an allowlist model. Empty allowlist = air-gapped, add LiteLLM = proxy-only, add domains = selective access, wildcard = open. Triggers on "network policy", "egress", "firewall", "network isolation", "container network".
 ---
 
 # Add Network Policy (Container Egress Control)
 
-This skill adds network isolation for NanoClaw agent containers. By default, agents have full internet access via Docker's bridge network. This skill restricts egress to only allowlisted destinations.
+This skill adds network isolation for NanoClaw agent containers using a single, unified allowlist model.
 
-**What it does:**
-- Creates an isolated Docker network (`nanoclaw-internal`) with no default internet access
-- Agent containers are placed on this network — they can only reach allowlisted services
-- If LiteLLM proxy is detected, it's automatically allowlisted
-- Configurable egress allowlist for additional services (stored outside project root)
+## How It Works
 
-## Architecture
+One concept: **an allowlist of what agents can reach.**
 
-```
-┌─────────────────────────────────────────────────────┐
-│  nanoclaw-internal (--internal = no default egress)  │
-│                                                      │
-│  ┌──────────┐    ┌──────────────────┐                │
-│  │ Agent A  │───→│  LiteLLM Proxy   │────→ Internet  │
-│  └──────────┘    │  (dual-homed)    │  (via bridge)  │
-│  ┌──────────┐    └──────────────────┘                │
-│  │ Agent B  │───→ (blocked)                          │
-│  └──────────┘                                        │
-│  ┌──────────┐    ┌──────────────────┐                │
-│  │ Agent C  │───→│  Egress Proxy    │────→ Allowlist  │
-│  └──────────┘    │  (optional)      │  (filtered)    │
-│                  └──────────────────┘                │
-└─────────────────────────────────────────────────────┘
-```
+| Allowlist | Docker Network | Effect | Squid Needed? |
+|-----------|---------------|--------|---------------|
+| `[]` (empty) | `--internal` | Air-gapped. No internet, no proxy. | No |
+| `["nanoclaw-litellm"]` | `--internal` | Proxy-only. API via LiteLLM, no web. | No |
+| `["nanoclaw-litellm", "google.com", ...]` | `--internal` | Filtered web. Needs egress proxy. | **Yes** (`/add-egress-proxy`) |
+| `["*"]` | regular | Full internet. Default Docker behavior. | No |
 
-**Two isolation levels:**
+**Docker's `--internal` flag** creates a network with zero internet gateway. Containers can only talk to other containers on the same network. Services that need internet (LiteLLM, Squid) are "dual-homed" — connected to both the internal network and the default bridge.
 
-1. **Basic (no egress proxy)**: Agents can only reach other containers on `nanoclaw-internal`. No internet. LiteLLM handles API calls. WebSearch/WebFetch tools won't work.
-
-2. **With egress proxy (future enhancement)**: A Squid/Envoy proxy on the internal network filters outbound requests against an allowlist. WebSearch/WebFetch route through this proxy.
-
-This skill implements Level 1 (basic). Level 2 can be added later as `/add-egress-proxy`.
+Without `/add-egress-proxy`, domain-level filtering is not available — the allowlist entries are informational for containers and dual-homed services. The isolation is binary: `--internal` (no internet) or regular (full internet). Squid adds the gradient between those two states.
 
 ## Phase 1: Pre-flight
 
-### Detect existing configuration
-
-Check for existing network and LiteLLM setup:
+### Detect existing setup
 
 ```bash
 docker network inspect nanoclaw-internal 2>/dev/null && echo "Network exists" || echo "Network does not exist"
 docker ps --filter name=nanoclaw-litellm --format '{{.Names}}' 2>/dev/null
 ```
 
-Read `.env` to check if `LITELLM_PROXY_URL` and `LITELLM_MODE` are configured.
+Read `.env` to check for `LITELLM_PROXY_URL`.
 
-### Ask the user about egress policy
+### Collect the allowlist
 
 Use `AskUserQuestion`:
 
-> How should I configure network egress for agent containers?
+> What should agent containers be allowed to reach?
 >
-> **Option A: Full lockdown** — Agents can ONLY reach the LiteLLM proxy (requires `/add-litellm-proxy`). WebSearch and WebFetch tools will not work. Best security.
+> **Option A: Nothing (air-gapped)** — Containers have zero network access. Agents can only read/write local files and use IPC. Use if agents don't need API calls at all.
 >
-> **Option B: Allowlisted egress** — Agents can reach the LiteLLM proxy AND specific allowlisted domains (e.g., api.anthropic.com, google.com for web search). You'll configure the allowlist.
+> **Option B: LiteLLM proxy only** — Containers can reach the LiteLLM proxy for API calls but nothing else. WebSearch/WebFetch won't work. Best security for most setups.
 >
-> **Option C: Proxy-only API, open web** — API calls go through the proxy, but agents retain full internet access for WebSearch/WebFetch. Moderate security — isolates API keys but not network access.
+> **Option C: Full internet** — Containers retain full internet access (default Docker behavior). API calls still route through LiteLLM if configured. Least restrictive.
 
 Wait for the user's choice.
 
-If they choose Option A and LiteLLM is not set up, tell them:
+If they choose Option B and LiteLLM is not set up:
 
-> Full lockdown requires the LiteLLM proxy to be configured first. Would you like me to set up LiteLLM now (run `/add-litellm-proxy`), or would you prefer a different egress policy?
+> Proxy-only mode requires the LiteLLM proxy. Would you like me to set it up now (`/add-litellm-proxy`)?
+
+Build the allowlist based on their choice:
+- Option A: `[]`
+- Option B: `["nanoclaw-litellm"]`
+- Option C: `["*"]`
 
 ## Phase 2: Create Network Infrastructure
 
 ### Step 1: Create the Docker network
 
-For Option A (full lockdown) or Option B (allowlisted):
+Determine network type from allowlist:
 
 ```bash
-# Remove existing network if it exists (no containers attached)
+# If allowlist is ["*"], create a regular network (full internet)
+# Otherwise, create an --internal network (no internet gateway)
+```
+
+For `["*"]` (full internet):
+
+```bash
+docker network create nanoclaw-internal 2>/dev/null || true
+```
+
+For anything else (empty or specific entries):
+
+```bash
+# Remove existing network if type needs to change
 docker network rm nanoclaw-internal 2>/dev/null || true
 
 # Create internal network (no internet gateway)
 docker network create --internal nanoclaw-internal
 ```
 
-The `--internal` flag is key — it creates a network with no default route to the internet. Containers on this network can only reach each other.
+### Step 2: Dual-home allowlisted services
 
-For Option C (proxy API, open web):
-
-```bash
-# Regular network (has internet via Docker gateway)
-docker network create nanoclaw-internal 2>/dev/null || true
-```
-
-### Step 2: Connect LiteLLM proxy to the network
-
-If LiteLLM is running in local mode, it needs to be on both networks:
-- `nanoclaw-internal` — so agents can reach it
-- `bridge` (default) — so it can reach external APIs
+Any container in the allowlist that needs internet access must be on both networks:
 
 ```bash
-# Connect LiteLLM to the internal network (if not already)
+# If LiteLLM is in the allowlist and running locally
 docker network connect nanoclaw-internal nanoclaw-litellm 2>/dev/null || true
-
-# Ensure it's also on bridge for API access
 docker network connect bridge nanoclaw-litellm 2>/dev/null || true
 ```
 
-### Step 3: Create egress allowlist configuration
+This is what makes the allowlist work without Squid for container-to-container services: the dual-homed service acts as a bridge. Agents on `--internal` can reach LiteLLM. LiteLLM (also on bridge) can reach the internet.
+
+### Step 3: Write the egress policy
 
 Create `~/.config/nanoclaw/egress-policy.json`:
 
-For Option A:
 ```json
 {
-  "mode": "lockdown",
+  "allowlist": ["nanoclaw-litellm"],
   "network": "nanoclaw-internal",
-  "networkInternal": true,
-  "allowlist": [],
-  "notes": "Full lockdown: agents can only reach containers on nanoclaw-internal (LiteLLM proxy)"
+  "dualHomedServices": ["nanoclaw-litellm"]
 }
 ```
 
-For Option B — ask the user which domains to allow, then:
-```json
-{
-  "mode": "allowlist",
-  "network": "nanoclaw-internal",
-  "networkInternal": true,
-  "allowlist": [
-    "api.anthropic.com",
-    "api.openai.com",
-    "www.google.com",
-    "*.googleapis.com"
-  ],
-  "notes": "Allowlisted egress: agents can reach listed domains and containers on nanoclaw-internal"
-}
-```
+The `dualHomedServices` array lists containers that should be connected to both networks at startup. This is auto-populated from the allowlist (only entries that match running container names).
 
-For Option C:
-```json
-{
-  "mode": "proxy-only",
-  "network": "nanoclaw-internal",
-  "networkInternal": false,
-  "allowlist": ["*"],
-  "notes": "Proxy-only mode: API calls through LiteLLM, agents retain internet access for WebSearch/WebFetch"
-}
-```
+- `allowlist: []` → `--internal` network, nothing reachable
+- `allowlist: ["nanoclaw-litellm"]` → `--internal` network, LiteLLM dual-homed
+- `allowlist: ["*"]` → regular network, full internet
 
 ## Phase 3: Integrate with Container Runner
 
 ### Step 1: Update configuration
 
-Read `src/config.ts`. If the LiteLLM skill hasn't already added `NANOCLAW_NETWORK`, add it:
+Read `src/config.ts`. If not already present from the LiteLLM skill, add:
 
 ```typescript
 export const NANOCLAW_NETWORK = process.env.NANOCLAW_NETWORK || 'nanoclaw-internal';
-```
-
-Add the egress policy path:
-
-```typescript
 export const EGRESS_POLICY_PATH = path.join(
   HOME_DIR,
   '.config',
@@ -178,7 +136,15 @@ Create `src/network-policy.ts`:
 ```typescript
 /**
  * Network policy enforcement for NanoClaw containers.
- * Reads egress policy from external config (tamper-proof from containers).
+ * Single model: an allowlist of reachable services/domains.
+ *
+ * - Empty allowlist → --internal Docker network (air-gapped)
+ * - ["nanoclaw-litellm"] → --internal + LiteLLM dual-homed (proxy-only)
+ * - ["*"] → regular Docker network (full internet)
+ * - Specific domains → --internal + Squid proxy (requires /add-egress-proxy)
+ *
+ * Config stored outside project root (tamper-proof from containers):
+ *   ~/.config/nanoclaw/egress-policy.json
  */
 import fs from 'fs';
 import { execSync } from 'child_process';
@@ -187,17 +153,15 @@ import { EGRESS_POLICY_PATH, NANOCLAW_NETWORK } from './config.js';
 import { logger } from './logger.js';
 
 export interface EgressPolicy {
-  mode: 'lockdown' | 'allowlist' | 'proxy-only' | 'open';
-  network: string;
-  networkInternal: boolean;
   allowlist: string[];
+  network: string;
+  dualHomedServices: string[];
 }
 
 const DEFAULT_POLICY: EgressPolicy = {
-  mode: 'open',
-  network: '',
-  networkInternal: false,
   allowlist: ['*'],
+  network: '',
+  dualHomedServices: [],
 };
 
 let cachedPolicy: EgressPolicy | null = null;
@@ -209,27 +173,35 @@ export function loadEgressPolicy(): EgressPolicy {
     if (fs.existsSync(EGRESS_POLICY_PATH)) {
       const raw = JSON.parse(fs.readFileSync(EGRESS_POLICY_PATH, 'utf-8'));
       cachedPolicy = {
-        mode: raw.mode || 'open',
-        network: raw.network || NANOCLAW_NETWORK,
-        networkInternal: raw.networkInternal ?? false,
         allowlist: raw.allowlist || ['*'],
+        network: raw.network || NANOCLAW_NETWORK,
+        dualHomedServices: raw.dualHomedServices || [],
       };
       logger.info(
-        { mode: cachedPolicy.mode, network: cachedPolicy.network },
+        {
+          network: cachedPolicy.network,
+          allowlistSize: cachedPolicy.allowlist.length,
+          isOpen: cachedPolicy.allowlist.includes('*'),
+        },
         'Egress policy loaded',
       );
       return cachedPolicy;
     }
   } catch (err) {
-    logger.warn({ err }, 'Failed to load egress policy, using defaults');
+    logger.warn({ err }, 'Failed to load egress policy, using defaults (open)');
   }
 
   cachedPolicy = DEFAULT_POLICY;
   return cachedPolicy;
 }
 
+/** Whether the policy uses --internal (no internet gateway). */
+function isInternal(policy: EgressPolicy): boolean {
+  return !policy.allowlist.includes('*');
+}
+
 /**
- * Get Docker network args for container based on egress policy.
+ * Get Docker network args for container launch.
  * Returns empty array if no network policy is configured.
  */
 export function getNetworkArgs(): string[] {
@@ -239,40 +211,76 @@ export function getNetworkArgs(): string[] {
 }
 
 /**
- * Ensure the Docker network exists, creating it if needed.
+ * Ensure the Docker network and dual-homed services are configured.
  * Called once at startup.
  */
 export function ensureNetwork(): void {
   const policy = loadEgressPolicy();
   if (!policy.network) return;
 
+  // Check if network exists
+  let networkExists = false;
   try {
     execSync(`docker network inspect ${policy.network}`, {
       stdio: 'pipe',
       timeout: 5000,
     });
-    logger.debug({ network: policy.network }, 'Docker network exists');
+    networkExists = true;
   } catch {
-    logger.info({ network: policy.network, internal: policy.networkInternal }, 'Creating Docker network');
-    const internalFlag = policy.networkInternal ? '--internal' : '';
-    execSync(`docker network create ${internalFlag} ${policy.network}`, {
-      stdio: 'pipe',
-      timeout: 10000,
-    });
-    logger.info({ network: policy.network }, 'Docker network created');
+    // Network doesn't exist, create it
   }
+
+  if (!networkExists) {
+    const internalFlag = isInternal(policy) ? '--internal' : '';
+    logger.info(
+      { network: policy.network, internal: isInternal(policy) },
+      'Creating Docker network',
+    );
+    execSync(
+      `docker network create ${internalFlag} ${policy.network}`.trim(),
+      { stdio: 'pipe', timeout: 10000 },
+    );
+  }
+
+  // Dual-home listed services (connect to both internal + bridge)
+  for (const service of policy.dualHomedServices) {
+    try {
+      // Check if service container is running
+      const running = execSync(
+        `docker ps --filter name=^${service}$ --format '{{.Names}}'`,
+        { stdio: 'pipe', encoding: 'utf-8', timeout: 5000 },
+      ).trim();
+      if (!running) continue;
+
+      // Connect to internal network
+      execSync(`docker network connect ${policy.network} ${service}`, {
+        stdio: 'pipe',
+        timeout: 5000,
+      });
+      logger.info({ service, network: policy.network }, 'Dual-homed service connected');
+    } catch {
+      // Already connected or not running — both are fine
+    }
+  }
+
+  logger.info(
+    {
+      network: policy.network,
+      internal: isInternal(policy),
+      dualHomed: policy.dualHomedServices,
+    },
+    'Network policy active',
+  );
 }
 
-/**
- * Reload the egress policy (e.g., after config change).
- */
+/** Reload the egress policy (e.g., after config change). */
 export function reloadEgressPolicy(): void {
   cachedPolicy = null;
   loadEgressPolicy();
 }
 ```
 
-### Step 3: Update container-runner.ts — network args
+### Step 3: Update container-runner.ts
 
 Read `src/container-runner.ts` and add the import:
 
@@ -280,20 +288,16 @@ Read `src/container-runner.ts` and add the import:
 import { getNetworkArgs } from './network-policy.js';
 ```
 
-In `buildContainerArgs()`, add network args. If the LiteLLM skill already added a network check, replace it with the generalized version:
-
-Find the section in `buildContainerArgs` that builds the args array. After the `--name` argument (and removing any existing LiteLLM-specific network logic), add:
+In `buildContainerArgs()`, after the `--name` argument, add:
 
 ```typescript
 // Apply network policy (egress control)
 args.push(...getNetworkArgs());
 ```
 
-This replaces any existing `LITELLM_MODE` network check. The network policy module handles all cases:
-- If no policy is configured → no network args (default Docker bridge)
-- If policy exists → uses the configured network
+If the LiteLLM skill already added a `LITELLM_MODE` network check, **replace it** with this line. The network policy module handles all cases now.
 
-### Step 4: Initialize network at startup
+### Step 4: Initialize at startup
 
 Read `src/index.ts` and add the import:
 
@@ -301,23 +305,13 @@ Read `src/index.ts` and add the import:
 import { ensureNetwork } from './network-policy.js';
 ```
 
-In the startup sequence (inside `main()`), after `ensureContainerRuntimeRunning()` and before the channel connections, add:
+After `ensureContainerRuntimeRunning()` and before channel connections, add:
 
 ```typescript
 ensureNetwork();
 ```
 
-### Step 5: Update .env.example
-
-Add to `.env.example` if not already present:
-
-```bash
-# === Network Policy ===
-# Docker network for container isolation (created automatically if egress policy exists)
-# NANOCLAW_NETWORK=nanoclaw-internal
-```
-
-### Step 6: Build
+### Step 5: Build
 
 ```bash
 npm run build
@@ -325,122 +319,94 @@ npm run build
 
 ## Phase 4: Verify
 
-### Test network isolation
-
-Start a test container on the internal network:
+### Test isolation (internal network)
 
 ```bash
-docker run --rm --network nanoclaw-internal curlimages/curl curl -sf --connect-timeout 5 http://api.anthropic.com 2>&1 || echo "BLOCKED (expected)"
+# Should FAIL — no internet on --internal network
+docker run --rm --network nanoclaw-internal curlimages/curl \
+  curl -sf --connect-timeout 5 http://api.anthropic.com 2>&1 || echo "BLOCKED (expected)"
+
+# Should SUCCEED — LiteLLM is dual-homed
+docker run --rm --network nanoclaw-internal curlimages/curl \
+  curl -sf --connect-timeout 5 http://nanoclaw-litellm:4000/health
 ```
 
-This should fail with a connection error — the `--internal` network has no internet gateway.
+### Test agent
 
-### Test proxy reachability (if LiteLLM is set up)
+Send a message to your agent. It should respond normally via LiteLLM.
 
-```bash
-docker run --rm --network nanoclaw-internal curlimages/curl curl -sf --connect-timeout 5 http://nanoclaw-litellm:4000/health
-```
-
-This should succeed — containers on the same network can reach each other.
-
-### Test agent functionality
-
-Tell the user:
-
-> Send a message to your agent. It should respond normally via the LiteLLM proxy.
->
-> Then try: "Search the web for today's news"
->
-> In lockdown mode, WebSearch will fail (no internet). In proxy-only mode, it will work normally.
->
-> Check logs: `tail -f logs/nanoclaw.log | grep -i network`
-
-### Verify isolation
+### Verify network state
 
 ```bash
-# Check the network configuration
-docker network inspect nanoclaw-internal
-
-# Check which containers are on the network
 docker network inspect nanoclaw-internal --format '{{range .Containers}}{{.Name}} {{end}}'
+cat ~/.config/nanoclaw/egress-policy.json
 ```
 
-## Phase 5: WebSearch/WebFetch Considerations
+## Changing the Policy
 
-### Current behavior by mode
+Edit `~/.config/nanoclaw/egress-policy.json` and restart NanoClaw. Examples:
 
-| Mode | API Calls | WebSearch | WebFetch |
-|------|-----------|-----------|----------|
-| Lockdown | Via LiteLLM | Blocked | Blocked |
-| Allowlist | Via LiteLLM | Depends on allowlist | Depends on allowlist |
-| Proxy-only | Via LiteLLM | Works | Works |
-| Open (default) | Direct | Works | Works |
+**Lockdown → Open:**
 
-### Future enhancement: /add-egress-proxy
-
-For allowlisted web access in lockdown mode, a future skill could add a Squid HTTP proxy on the internal network:
-
-```
-Agent → Squid Proxy (on nanoclaw-internal) → Allowlisted domains only
+```json
+{ "allowlist": ["*"], "network": "nanoclaw-internal", "dualHomedServices": [] }
 ```
 
-The proxy would:
-1. Run as a Docker container on `nanoclaw-internal` with dual-homing
-2. Filter outbound requests against the domain allowlist
-3. Agents' WebSearch/WebFetch would use `HTTP_PROXY` environment variable
+Then recreate the network without `--internal`:
 
-This is noted here for future implementation. LiteLLM can also proxy web search if the model supports it.
+```bash
+docker network rm nanoclaw-internal && docker network create nanoclaw-internal
+```
 
-### WebSearch through LiteLLM
+**Open → Lockdown:**
 
-LiteLLM supports web search as a model capability. If using Claude models that support web search, the search requests go through LiteLLM's API — no direct internet access needed. This is the recommended approach for lockdown mode.
+```json
+{ "allowlist": ["nanoclaw-litellm"], "network": "nanoclaw-internal", "dualHomedServices": ["nanoclaw-litellm"] }
+```
+
+Then recreate with `--internal`:
+
+```bash
+docker network rm nanoclaw-internal && docker network create --internal nanoclaw-internal
+```
+
+## Future: /add-egress-proxy
+
+For selective domain filtering (the middle ground between proxy-only and open), a Squid HTTP proxy skill would:
+
+1. Run Squid as a Docker container, dual-homed on `nanoclaw-internal` + bridge
+2. Read domain allowlist from `egress-policy.json`
+3. Pass `HTTP_PROXY=http://nanoclaw-squid:3128` to agent containers
+4. Squid filters outbound requests — only allowlisted domains pass
+5. WebSearch/WebFetch work through the proxy
+
+This is a separate skill because it adds a new container and complexity. The base network policy (this skill) gives you the binary choice that covers most use cases.
 
 ## Troubleshooting
 
-### Agent can't connect to anything
+### Agent can't reach LiteLLM
 
-1. Check network exists: `docker network inspect nanoclaw-internal`
-2. Check agent is on the network: look for `--network nanoclaw-internal` in container logs
-3. Check egress policy: `cat ~/.config/nanoclaw/egress-policy.json`
-4. Verify LiteLLM is on the network: `docker inspect nanoclaw-litellm | grep -A10 Networks`
+1. Verify LiteLLM is on the internal network: `docker network inspect nanoclaw-internal`
+2. Reconnect if needed: `docker network connect nanoclaw-internal nanoclaw-litellm`
+3. Check dual-homing: `docker inspect nanoclaw-litellm --format '{{json .NetworkSettings.Networks}}' | python3 -m json.tool`
 
-### WebSearch stopped working after enabling network policy
+### Changing network type requires recreation
 
-Expected in lockdown mode. Options:
-1. Switch to proxy-only mode (edit `~/.config/nanoclaw/egress-policy.json`, set `"mode": "proxy-only"`, `"networkInternal": false`)
-2. Use LiteLLM's built-in web search capability
-3. Wait for `/add-egress-proxy` skill
+Docker doesn't allow changing a network between `--internal` and regular. You must delete and recreate it (stop all containers on it first).
 
-### Network already exists error
+### WebSearch stopped working
 
-```bash
-docker network rm nanoclaw-internal
-# Then re-run setup
-```
-
-Note: all containers on the network must be stopped first.
-
-### LiteLLM not reachable from agents
-
-1. Verify LiteLLM is on the internal network:
-   ```bash
-   docker network inspect nanoclaw-internal --format '{{range .Containers}}{{.Name}} {{end}}'
-   ```
-2. If not, reconnect:
-   ```bash
-   docker network connect nanoclaw-internal nanoclaw-litellm
-   ```
-3. Restart NanoClaw to pick up changes
+Expected when `allowlist` doesn't include `"*"`. Either:
+- Add `"*"` to the allowlist (opens internet)
+- Wait for `/add-egress-proxy` (filtered web access)
+- Use LiteLLM's built-in web search pass-through
 
 ## Removal
 
-To remove the network policy:
-
-1. Remove egress policy: `rm ~/.config/nanoclaw/egress-policy.json`
+1. Remove policy: `rm ~/.config/nanoclaw/egress-policy.json`
 2. Remove `src/network-policy.ts`
 3. Remove `EGRESS_POLICY_PATH` from `src/config.ts`
-4. Remove `ensureNetwork()` call from `src/index.ts`
-5. Remove `getNetworkArgs()` import and call from `src/container-runner.ts`
-6. Remove the Docker network: `docker network rm nanoclaw-internal`
-7. Rebuild: `npm run build`
-8. Restart: `launchctl kickstart -k gui/$(id -u)/com.nanoclaw` (macOS) or `systemctl --user restart nanoclaw` (Linux)
+4. Remove `ensureNetwork()` from `src/index.ts`
+5. Remove `getNetworkArgs()` from `src/container-runner.ts`
+6. Remove Docker network: `docker network rm nanoclaw-internal`
+7. Rebuild and restart
